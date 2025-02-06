@@ -166,7 +166,8 @@ auto handle_request(beast::string_view doc_root,
   };
 
   // Make sure we can handle the method
-  if (req.method() != http::verb::get && req.method() != http::verb::head)
+  if (req.method() != http::verb::get && req.method() != http::verb::post &&
+      req.method() != http::verb::head)
     co_return bad_request("Unknown HTTP-method");
 
   // Request path must be absolute and not contain "..".
@@ -232,7 +233,7 @@ auto handle_request(beast::string_view doc_root,
       redis::response<std::optional<std::vector<int64_t>>, int> redis_resp;
       std::string key = "follow:" + std::to_string(user_id);
       redis_req.push("SMEMBERS", key);
-      redis_req.push("EXPIRE", key, 60);
+      // redis_req.push("EXPIRE", key, 60);
 
       co_await redis_conn->async_exec(redis_req, redis_resp, net::deferred);
       json::array all_follows;
@@ -311,17 +312,41 @@ auto handle_request(beast::string_view doc_root,
       }
       co_return json_response(req, {{"posts", post_hist}});
     }
-
     // 获取time时间点前最近n个订阅流
     if (api_match("/api/feed", http::verb::get)) {
       int user_id = std::stoi(req.target().substr(strlen("/api/feed/")));
       auto value = json::parse(req.body());
       std::string max_time(value.at("max_time").as_string());
       int page_size = value.at("page_size").as_int64();
-
-      "SMEMBERS follow:{my_id} -> $1={user_id}..."
-      "TS.MREVRANGE - + FILTER user_id=($1) COUNT n -> $2={post_id}..."
-      "HMGET posts $2";
+      redis::request redis_req;
+      redis_req.push("SMEMBERS", "follow:" + std::to_string(user_id));
+      redis::response<std::optional<std::vector<int64_t>>> redis_resp_id;
+      co_await redis_conn->async_exec(redis_req, redis_resp_id, net::deferred);
+      if (std::get<0>(redis_resp_id).value()) {
+        const auto &my_follow = std::get<0>(redis_resp_id).value().value();
+        std::stringstream ss("TS.MREVRANGE - + FILTER userid=(");
+        for (int i = 0; i < my_follow.size(); i++) {
+          ss << my_follow[i] << (i != my_follow.size() - 1 ? "," : "");
+        }
+        ss << ") COUNT " << page_size;
+        redis_req.clear();
+        redis_req.push(ss.str());
+        co_await redis_conn->async_exec(redis_req, redis_resp_id,
+                                        net::deferred);
+        if (std::get<0>(redis_resp_id).value()) {
+          const auto &post_ids = std::get<0>(redis_resp_id).value().value();
+          redis_req.clear();
+          redis_req.push_range("HMGET posts", post_ids);
+          redis::response<std::optional<std::vector<std::string>>> resp_content;
+          co_await redis_conn->async_exec(redis_req, resp_content,
+                                          net::deferred);
+          if (std::get<0>(resp_content).value()) {
+            const auto &contents = std::get<0>(resp_content).value().value();
+            json::array posts(contents.begin(), contents.end());
+            co_return json_response(req, {{"posts", posts}});
+          } // TODO(PLB): SELECT * FROM posts WHERE id IN (...)
+        }
+      }
 
       // 从MySQL查询详细信息
       json::array posts;
@@ -426,18 +451,6 @@ auto do_session(beast::tcp_stream stream,
     // Handle the request
     http::message_generator msg = co_await handle_request(
         *doc_root, std::move(req), mysql_conn, redis_conn);
-    // // Redis
-    // std::string buf;
-    // redis_req.push("PING", buf);
-    // co_await redis_conn->async_exec(redis_req, redis_resp, net::deferred);
-    // std::get<0>(redis_resp).value().clear();
-    // redis_req.clear();
-
-    // // Mysql
-    // const char *sql = "SELECT 'Hello world!'";
-    // mysql::results result;
-    // co_await mysql_conn->async_execute(sql, result);
-    // Determine if we should close the connection
     keep_alive = msg.keep_alive();
 
     // Send the response
@@ -474,7 +487,7 @@ auto do_listen(net::ip::tcp::endpoint endpoint,
 auto main(int argc, char *argv[]) -> int {
   // Check command line arguments.
   if (argc != 5) {
-    std::cerr << "Usage: http-server-awaitable <address> <port> <doc_root> "
+    std::cerr << "Usage: http_server <address> <port> <doc_root> "
                  "<threads>\n"
               << "Example:\n"
               << "    http-server-awaitable 0.0.0.0 8080 . 1\n";
