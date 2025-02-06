@@ -3,6 +3,7 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/thread_pool.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/beast/core.hpp>
@@ -10,16 +11,12 @@
 #include <boost/beast/version.hpp>
 #include <boost/config.hpp>
 #include <boost/json.hpp>
-#include <boost/json/array.hpp>
-#include <boost/json/object.hpp>
 #include <boost/mysql.hpp>
-#include <boost/mysql/any_connection.hpp>
-#include <boost/mysql/datetime.hpp>
 #include <boost/redis.hpp>
-#include <boost/redis/ignore.hpp>
-#include <boost/redis/request.hpp>
+#include <boost/redis/src.hpp> // REQUIRED to compile
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -107,9 +104,9 @@ auto path_cat(beast::string_view base, beast::string_view path) -> std::string {
 }
 
 template <class Body, class Allocator>
-auto json_response(
-    const http::request<Body, http::basic_fields<Allocator>> &req,
-    const json::value &data, http::status status = http::status::ok)
+inline auto
+json_response(const http::request<Body, http::basic_fields<Allocator>> &req,
+              const json::value &data, http::status status = http::status::ok)
     -> http::response<http::string_body> {
   http::response<http::string_body> res{status, req.version()};
   res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
@@ -125,8 +122,7 @@ auto json_response(
 // The concrete type of the response message (which depends on the
 // request), is type-erased in message_generator.
 template <class Body, class Allocator>
-auto handle_request(beast::string_view doc_root,
-                    http::request<Body, http::basic_fields<Allocator>> &&req,
+auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
                     mysql_conn_ptr mysql_conn, redis_conn_ptr redis_conn)
     -> net::awaitable<http::message_generator> {
   // Returns a bad request response
@@ -175,11 +171,6 @@ auto handle_request(beast::string_view doc_root,
       req.target().find("..") != beast::string_view::npos)
     co_return bad_request("Illegal request-target");
 
-  // Build the path to the requested file
-  std::string path = path_cat(doc_root, req.target());
-  if (req.target().back() == '/')
-    path.append("index.html");
-
   auto api_match = [&req](const std::string_view url, http::verb method) {
     return req.target().starts_with(url) && req.method() == method;
   };
@@ -189,13 +180,12 @@ auto handle_request(beast::string_view doc_root,
     if (api_match("/api/register/", http::verb::post)) {
       auto value = json::parse(req.body());
       std::string username = value.at("username").as_string().c_str();
-      std::string password = value.at("password").as_string().c_str();
+      std::string password = value.at("password_hash").as_string().c_str();
 
       // 插入用户
       mysql::results result;
       auto stmt = co_await mysql_conn->async_prepare_statement(
-          "INSERT INTO users (username, password) VALUES (?, "
-          "?)");
+          "INSERT INTO users (username, password_hash) VALUES (?, ?)");
       co_await mysql_conn->async_execute(stmt.bind(username, password), result);
       co_await mysql_conn->async_close_statement(stmt);
 
@@ -350,7 +340,6 @@ auto handle_request(beast::string_view doc_root,
 
       // 从MySQL查询详细信息
       json::array posts;
-      // TODO(PLB): How to use Redis as cache for this?
       mysql::results result;
       auto stmt = co_await mysql_conn->async_prepare_statement(
           "SELECT p.* FROM posts p JOIN follows f ON p.user_id = f.followee_id "
@@ -377,6 +366,11 @@ auto handle_request(beast::string_view doc_root,
     co_return json_response(req, {{"error", e.what()}},
                             http::status::bad_request);
   }
+
+  // Build the path to the requested file
+  std::string path = path_cat(".", req.target());
+  if (req.target().back() == '/')
+    path.append("index.html");
 
   // Attempt to open the file
   beast::error_code ec;
@@ -416,28 +410,21 @@ auto handle_request(beast::string_view doc_root,
 }
 
 // Handles an HTTP server connection
-auto do_session(beast::tcp_stream stream,
-                std::shared_ptr<std::string const> doc_root)
-    -> net::awaitable<void> {
+auto do_session(beast::tcp_stream stream, redis::config redis_cfg,
+                mysql::connect_params mysql_params) -> net::awaitable<void> {
   // This buffer is required to persist across reads
   beast::flat_buffer buffer;
   auto executor = co_await net::this_coro::executor;
-  // TODO(PLB):
-  redis::config cfg;
+
   auto redis_conn = std::make_shared<redis::connection>(executor);
-  redis_conn->async_run(cfg, {}, net::consign(net::detached, redis_conn));
+  redis_conn->async_run(redis_cfg, {}, net::consign(net::detached, redis_conn));
   redis::request redis_req;
   redis::response<std::string> redis_resp;
 
   auto mysql_conn = std::make_shared<mysql::any_connection>(executor);
-  mysql::connect_params params;
-  params.server_address.emplace_host_and_port("localhost", 3306);
-  params.username = "username";
-  params.password = "password";
-  params.database = "test_db";
 
   // Connect to the server
-  co_await mysql_conn->async_connect(params);
+  co_await mysql_conn->async_connect(mysql_params);
   bool keep_alive;
   std::string redis_buffer;
   do {
@@ -449,8 +436,8 @@ auto do_session(beast::tcp_stream stream,
     co_await http::async_read(stream, buffer, req);
 
     // Handle the request
-    http::message_generator msg = co_await handle_request(
-        *doc_root, std::move(req), mysql_conn, redis_conn);
+    http::message_generator msg =
+        co_await handle_request(std::move(req), mysql_conn, redis_conn);
     keep_alive = msg.keep_alive();
 
     // Send the response
@@ -467,18 +454,57 @@ auto do_session(beast::tcp_stream stream,
   // dropped the connection already.
 }
 
+template <typename T>
+inline void pass_cfg_if_exists(T &dest, const json::object &cfg,
+                               const std::string_view field) {
+  if (cfg.contains(field)) {
+    dest = cfg.at(field).as_string();
+  }
+}
+
+auto generate_config(const json::object &config)
+    -> std::pair<redis::config, mysql::connect_params> {
+  redis::config redis_cfg;
+  if (config.contains("redis")) {
+    const auto &cfg = config.at("redis").as_object();
+    pass_cfg_if_exists(redis_cfg.addr.host, cfg, "host");
+    pass_cfg_if_exists(redis_cfg.addr.port, cfg, "port");
+    pass_cfg_if_exists(redis_cfg.username, cfg, "username");
+    pass_cfg_if_exists(redis_cfg.password, cfg, "password");
+  }
+
+  mysql::connect_params mysql_params;
+  if (!config.contains("mysql")) {
+    std::cerr << "Cannot find mysql config!\n";
+    abort();
+  }
+  const auto &cfg = config.at("mysql").as_object();
+  std::string hostname("localhost");
+  pass_cfg_if_exists(hostname, cfg, "host");
+  uint16_t port = mysql::default_port;
+  if (cfg.contains("port")) {
+    port = cfg.at("port").as_int64();
+  }
+  mysql_params.server_address.emplace_host_and_port(hostname, port);
+  pass_cfg_if_exists(mysql_params.username, cfg, "username");
+  pass_cfg_if_exists(mysql_params.password, cfg, "password");
+  pass_cfg_if_exists(mysql_params.database, cfg, "database");
+  return {redis_cfg, mysql_params};
+}
+
 // Accepts incoming connections and launches the sessions
-auto do_listen(net::ip::tcp::endpoint endpoint,
-               std::shared_ptr<std::string const> doc_root)
+auto do_listen(net::ip::tcp::endpoint endpoint, json::object config)
     -> net::awaitable<void> {
   auto executor = co_await net::this_coro::executor;
   auto acceptor = net::ip::tcp::acceptor{executor, endpoint};
+
+  auto [redis_cfg, mysql_params] = generate_config(config);
 
   for (;;) {
     net::co_spawn(
         executor,
         do_session(beast::tcp_stream{co_await acceptor.async_accept()},
-                   doc_root),
+                   redis_cfg, mysql_params),
         net::detached);
     // TODO(PLB): make sure do_session's exception is not thrown out..
   }
@@ -487,22 +513,28 @@ auto do_listen(net::ip::tcp::endpoint endpoint,
 auto main(int argc, char *argv[]) -> int {
   // Check command line arguments.
   if (argc != 5) {
-    std::cerr << "Usage: http_server <address> <port> <doc_root> "
-                 "<threads>\n"
-              << "Example:\n"
-              << "    http-server-awaitable 0.0.0.0 8080 . 1\n";
+    std::cerr
+        << "Usage: feed-service <address> <port> <config_file> <threads>\n"
+        << "Example:\n"
+        << "    feed-service 0.0.0.0 8080 ./config.json 1\n";
     return EXIT_FAILURE;
   }
   auto const address = net::ip::make_address(argv[1]);
   auto const port = static_cast<uint16_t>(std::atoi(argv[2]));
-  auto const doc_root = std::make_shared<std::string>(argv[3]);
+  auto const config_file = argv[3];
   auto const threads = std::max<int>(1, std::atoi(argv[4]));
+
+  std::ifstream fs(config_file);
+  std::stringstream buffer;
+  buffer << fs.rdbuf();
+  json::object config = json::parse(buffer.str()).as_object();
 
   // The io_context is required for all I/O
   net::io_context ioc{threads};
+  net::thread_pool s;
 
   // Spawn a listening port
-  net::co_spawn(ioc, do_listen(net::ip::tcp::endpoint{address, port}, doc_root),
+  net::co_spawn(ioc, do_listen(net::ip::tcp::endpoint{address, port}, config),
                 net::detached);
 
   // Run the I/O service on the requested number of threads

@@ -24,14 +24,14 @@ sudo ./b2 install
 - [x] `POST /api/follow/{user_id} {"follow_id": ...} -> bool`
 - [x] `GET /api/posts/{user_id} -> List of post`
 - [x] `POST /api/post/{user_id} {"content": ...} -> bool`
-- [ ] `GET /api/timeline/{user_id} -> List of post`
+- [x] `GET /api/feed/{user_id} -> List of post`
 
 ## TODO List
 - [x] Async framework
 - [x] MySQL connection, async
 - [x] Redis connection, async
 - [x] Multi-threading
-- [ ] API and processing logic
+- [x] API and processing logic
 - [ ] Testing
 - [ ] Distributed service
 - [ ] Micro-service + Message Queue
