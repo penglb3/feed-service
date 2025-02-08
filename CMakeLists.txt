@@ -35,3 +35,11 @@ add_executable(feed-service src/http_server.cc)
 target_include_directories(feed-service PUBLIC include)
 target_link_libraries(echo_server uring)
 target_link_libraries(feed-service Boost::charconv Threads::Threads OpenSSL::Crypto OpenSSL::SSL Boost::json)
+
+add_library(feed-client src/http_client.cc)
+target_include_directories(feed-client PUBLIC include)
+target_link_libraries(feed-client OpenSSL::SSL Boost::json)
+
+add_executable(basic_function_test test/basic_function.cc)
+target_link_libraries(basic_function_test feed-client)
+add_test(NAME basic_function COMMAND basic_function_test)

@@ -3,16 +3,18 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
-#include <boost/asio/thread_pool.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/this_coro.hpp>
+#include <boost/asio/thread_pool.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
 #include <boost/config.hpp>
 #include <boost/json.hpp>
 #include <boost/mysql.hpp>
+#include <boost/mysql/diagnostics.hpp>
 #include <boost/redis.hpp>
+#include <boost/redis/response.hpp>
 #include <boost/redis/src.hpp> // REQUIRED to compile
 #include <cstdint>
 #include <cstdlib>
@@ -175,45 +177,92 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
     return req.target().starts_with(url) && req.method() == method;
   };
 
+  using ts_revrange_return_type = std::vector<std::pair<int, std::string>>;
+
   try {
     // 用户注册 POST
     if (api_match("/api/register/", http::verb::post)) {
       auto value = json::parse(req.body());
-      std::string username = value.at("username").as_string().c_str();
-      std::string password = value.at("password_hash").as_string().c_str();
+      std::string_view username = value.at("username").as_string().c_str();
+      std::string_view password = value.at("password_hash").as_string().c_str();
 
       // 插入用户
       mysql::results result;
+      mysql::diagnostics diag;
       auto stmt = co_await mysql_conn->async_prepare_statement(
           "INSERT INTO users (username, password_hash) VALUES (?, ?)");
-      co_await mysql_conn->async_execute(stmt.bind(username, password), result);
+      co_await mysql_conn->async_execute(stmt.bind(username, password), result,
+                                         diag);
       co_await mysql_conn->async_close_statement(stmt);
+      if (!diag.server_message().empty()) {
+        co_return json_response(req, {{"error", diag.server_message()}});
+      }
 
       uint64_t user_id = result.last_insert_id();
 
       redis::request redis_req;
       std::string id_str(std::to_string(user_id));
+      redis_req.push("SET", username, user_id);
       redis_req.push("TS.CREATE", "post_id:" + id_str, "LABEL user_id", id_str);
       co_await redis_conn->async_exec(redis_req, redis::ignore, net::deferred);
 
       co_return json_response(std::move(req), {{"user_id", user_id}});
     }
-    // 关注用户 POST
-    if (api_match("/api/follow/", http::verb::post)) {
-      int user_id = std::stoi(req.target().substr(strlen("/api/follow/")));
-      int follow_id = json::parse(req.body()).at("follow_id").as_int64();
-
-      redis::request redis_req;
-      redis_req.push("SADD", "follow:" + std::to_string(user_id), follow_id);
-      co_await redis_conn->async_exec(redis_req, redis::ignore, net::deferred);
+    if (api_match("/api/login/", http::verb::post)) {
+      auto value = json::parse(req.body());
+      std::string_view username = value.at("username").as_string().c_str();
+      std::string_view password_hash =
+          value.at("password_hash").as_string().c_str();
 
       mysql::results result;
       auto stmt = co_await mysql_conn->async_prepare_statement(
-          "INSERT INTO follows (follower_id, followee_id) VALUES (?, ?)");
-      co_await mysql_conn->async_execute(stmt.bind(user_id, follow_id), result);
+          "SELECT user_id, password_hash FROM users WHERE username = ?");
+      co_await mysql_conn->async_execute(stmt.bind(username), result);
       co_await mysql_conn->async_close_statement(stmt);
 
-      co_return json_response(req, {{"status", "succuess"}});
+      json::object res;
+      if (!result.empty()) {
+        const auto &row = result.rows().at(0);
+        if (row.at(1).as_string() == password_hash) {
+          res["user_id"] = row.at(0).as_int64();
+        }
+      }
+      co_return json_response(req, res);
+    }
+    // 关注用户 POST
+    if (api_match("/api/follow/", http::verb::post)) {
+      int user_id = std::stoi(req.target().substr(strlen("/api/follow/")));
+      std::string_view follow_name =
+          json::parse(req.body()).at("follow_name").as_string().c_str();
+
+      redis::request redis_req;
+      redis::response<std::optional<int64_t>> redis_resp;
+      mysql::results result;
+      redis_req.push("GET", follow_name);
+      co_await redis_conn->async_exec(redis_req, redis_resp, net::deferred);
+      if (std::get<0>(redis_resp).value()) {
+        redis_req.clear();
+        int follow_id = std::get<0>(redis_resp).value().value();
+        redis_req.push("SADD", "follow:" + std::to_string(user_id), follow_id);
+        co_await redis_conn->async_exec(redis_req, redis::ignore,
+                                        net::deferred);
+
+        auto stmt = co_await mysql_conn->async_prepare_statement(
+            "INSERT INTO follows (follower_id, followee_id) VALUES (?, ?)");
+        co_await mysql_conn->async_execute(stmt.bind(user_id, follow_id),
+                                           result);
+        co_await mysql_conn->async_close_statement(stmt);
+      } else {
+        auto stmt = co_await mysql_conn->async_prepare_statement(
+            "INSERT INTO follows (follower_id, followee_id) "
+            "SELECT ?, user_id from users WHERE username = ?");
+        co_await mysql_conn->async_execute(stmt.bind(user_id, follow_name),
+                                           result);
+        co_await mysql_conn->async_close_statement(stmt);
+        // TODO(): non-existent username
+      }
+
+      co_return json_response(req, {{"status", "success"}});
     }
     // 获取关注列表 GET
     if (api_match("/api/follow/", http::verb::get)) {
@@ -246,11 +295,25 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
     }
 
     // 发布动态 POST
-    if (api_match("/api/post", http::verb::post)) {
-      auto value = json::parse(req.body());
-      int user_id = value.at("user_id").as_int64();
-      std::string content = value.at("content").as_string().c_str();
-
+    if (api_match("/api/post/", http::verb::post)) {
+      int user_id;
+      std::string_view content;
+      try {
+        auto value = json::parse(req.body()).as_object();
+        if (!value.contains("user_id")) {
+          co_return json_response(req, {{"error", "no user_id"}},
+                                  http::status::bad_request);
+        }
+        user_id = value.at("user_id").as_int64();
+        if (!value.contains("content")) {
+          co_return json_response(req, {{"error", "no content"}},
+                                  http::status::bad_request);
+        }
+        content = value.at("content").as_string().c_str();
+      } catch (const std::exception &e) {
+        co_return json_response(req, {{"error", e.what()}},
+                                http::status::bad_request);
+      }
       // 插入动态
       mysql::results result;
       // TODO(): statement pool along with mysql connection pool
@@ -264,38 +327,80 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
 
       redis::request redis_req;
       redis_req.push("HSET", "posts", post_id, content);
-      redis_req.push("TS.ADD", "post_id:" + std::to_string(user_id),
-                     time(nullptr), post_id);
+      redis_req.push("TS.ADD", "post_id:" + std::to_string(user_id), post_id,
+                     post_id);
       co_await redis_conn->async_exec(redis_req, redis::ignore, net::deferred);
 
       co_return json_response(req, {{"post_id", post_id}});
     }
 
     // 获取某个用户的动态历史 GET
-    if (api_match("/api/post", http::verb::get)) {
-      auto value = json::parse(req.body());
-      int user_id = value.at("user_id").as_int64();
+    if (api_match("/api/post/", http::verb::get)) {
+      json::object value;
+      try {
+        value = json::parse(req.body()).as_object();
+      } catch (const std::exception &e) {
+        co_return json_response(req, {{"error", e.what()}},
+                                http::status::bad_request);
+      }
+      int user_id;
+      std::string_view username;
+      if (value.contains("user_id")) {
+        user_id = value.at("user_id").as_int64();
+      } else if (value.contains("username")) {
+        username = value.at("username").as_string().c_str();
+        redis::request redis_req;
+        redis::response<std::optional<std::string>> resp_id;
+        redis_req.push("GET", username);
+        co_await redis_conn->async_exec(redis_req, resp_id, net::deferred);
+        if (std::get<0>(resp_id).value()) {
+          user_id = std::stoi(std::get<0>(resp_id).value().value());
+        } else {
+          mysql::results mysql_result;
+          auto stmt = co_await mysql_conn->async_prepare_statement(
+              "SELECT user_id from users WHERE username = ?");
+          co_await mysql_conn->async_execute(stmt.bind(username), mysql_result);
+          co_await mysql_conn->async_close_statement(stmt);
+          user_id = mysql_result.rows().at(0).at(0).as_int64();
+        }
+      } else {
+        co_return json_response(req, {{"error", "no user id specified"}},
+                                http::status::bad_request);
+      }
+
       redis::request redis_req;
-      redis::response<std::optional<std::vector<int64_t>>> redis_resp_id;
-      redis_req.push("ZRANGE", "post_id:" + std::to_string(user_id), 0, -1);
+      redis::generic_response redis_resp_id;
+      redis_req.push("TS.REVRANGE", "post_id:" + std::to_string(user_id), "-",
+                     "+");
       co_await redis_conn->async_exec(redis_req, redis_resp_id, net::deferred);
       json::array post_hist;
-      if (std::get<0>(redis_resp_id).value()) {
-        const auto &post_ids = std::get<0>(redis_resp_id).value().value();
+      if (redis_resp_id.has_value()) {
+        std::vector<std::string_view> post_ids(1, "posts");
+        for (const auto &node : redis_resp_id.value()) {
+          if (node.data_type == redis::resp3::type::doublean) {
+            post_ids.emplace_back(node.value);
+          }
+        }
         redis_req.clear();
-        redis_req.push_range("HMGET posts", post_ids);
+        redis_req.push_range("HMGET", post_ids.begin(), post_ids.end());
         redis::response<std::optional<std::vector<std::string>>>
             redis_resp_post;
         co_await redis_conn->async_exec(redis_req, redis_resp_post,
                                         net::deferred);
-        const auto &posts = std::get<0>(redis_resp_post).value().value();
-        post_hist = json::array(posts.begin(), posts.end());
-      } else {
+        if (std::get<0>(redis_resp_post).value()) {
+          const auto &posts = std::get<0>(redis_resp_post).value().value();
+          post_hist = json::array(posts.begin(), posts.end());
+        }
+      }
+      if (post_hist.empty()) {
         mysql::results mysql_result;
         auto stmt = co_await mysql_conn->async_prepare_statement(
             "SELECT p.content FROM posts WHERE user_id = ?");
         co_await mysql_conn->async_execute(stmt.bind(user_id), mysql_result);
         co_await mysql_conn->async_close_statement(stmt);
+        if (mysql_result.empty()) {
+          co_return json_response(req, {});
+        }
         for (const auto &row : mysql_result.rows()) {
           post_hist.push_back(row.at(0).as_string());
         }
@@ -305,9 +410,20 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
     // 获取time时间点前最近n个订阅流
     if (api_match("/api/feed", http::verb::get)) {
       int user_id = std::stoi(req.target().substr(strlen("/api/feed/")));
-      auto value = json::parse(req.body());
-      std::string max_time(value.at("max_time").as_string());
-      int page_size = value.at("page_size").as_int64();
+      std::string max_time(std::to_string(time(nullptr)));
+      int page_size = 10;
+      try {
+        auto value = json::parse(req.body()).as_object();
+        if (value.contains("max_time")) {
+          max_time = value.at("max_time").as_string();
+        }
+        if (value.contains("page_size")) {
+          page_size = value.at("page_size").as_int64();
+        }
+      } catch (const std::exception &e) {
+        co_return json_response(req, {{"error", e.what()}},
+                                http::status::bad_request);
+      }
       redis::request redis_req;
       redis_req.push("SMEMBERS", "follow:" + std::to_string(user_id));
       redis::response<std::optional<std::vector<int64_t>>> redis_resp_id;
@@ -321,12 +437,17 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
         ss << ") COUNT " << page_size;
         redis_req.clear();
         redis_req.push(ss.str());
-        co_await redis_conn->async_exec(redis_req, redis_resp_id,
-                                        net::deferred);
-        if (std::get<0>(redis_resp_id).value()) {
-          const auto &post_ids = std::get<0>(redis_resp_id).value().value();
+        redis::generic_response resp_post_id;
+        co_await redis_conn->async_exec(redis_req, resp_post_id, net::deferred);
+        if (resp_post_id.has_value()) {
+          std::vector<std::string_view> post_ids(1, "posts");
+          for (const auto &node : resp_post_id.value()) {
+            if (node.data_type == redis::resp3::type::simple_string) {
+              post_ids.emplace_back(node.value);
+            }
+          }
           redis_req.clear();
-          redis_req.push_range("HMGET posts", post_ids);
+          redis_req.push_range("HMGET", post_ids);
           redis::response<std::optional<std::vector<std::string>>> resp_content;
           co_await redis_conn->async_exec(redis_req, resp_content,
                                           net::deferred);
@@ -364,7 +485,7 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
     }
   } catch (const std::exception &e) {
     co_return json_response(req, {{"error", e.what()}},
-                            http::status::bad_request);
+                            http::status::internal_server_error);
   }
 
   // Build the path to the requested file

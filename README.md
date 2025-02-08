@@ -19,11 +19,11 @@ sudo ./b2 install
 
 ## API List
 - [x] `POST /api/register {"username": ..., "password_hash": ...} -> user_id"`
-- [x] `POST /api/login {"username": ..., "password_hash": ...} -> bool`
+- [x] `POST /api/login {"username": ..., "password_hash": ...} -> user_id`
 - [x] `GET /api/follow/{user_id} -> List of user_id`
-- [x] `POST /api/follow/{user_id} {"follow_id": ...} -> bool`
-- [x] `GET /api/posts/{user_id} -> List of post`
-- [x] `POST /api/post/{user_id} {"content": ...} -> bool`
+- [x] `POST /api/follow/{user_id} {"username": ...} -> user_id`
+- [x] `GET /api/posts/{username | user_id} -> List of post`
+- [x] `POST /api/post/ {"user_id":..., "content": ...} -> bool`
 - [x] `GET /api/feed/{user_id} -> List of post`
 
 ## TODO List
@@ -32,6 +32,10 @@ sudo ./b2 install
 - [x] Redis connection, async
 - [x] Multi-threading
 - [x] API and processing logic
-- [ ] Testing
+- [x] Testing
+  - [x] Basic functionality
+  - [ ] Smoke test / Error handling
+  - [ ] Stress test
+- [ ] Connection pool
 - [ ] Distributed service
 - [ ] Micro-service + Message Queue
