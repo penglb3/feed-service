@@ -203,7 +203,7 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
       redis::request redis_req;
       std::string id_str(std::to_string(user_id));
       redis_req.push("SET", username, user_id);
-      redis_req.push("TS.CREATE", "post_id:" + id_str, "LABEL user_id", id_str);
+      redis_req.push("TS.CREATE", "post_id:" + id_str, "LABELS", "user_id", id_str);
       co_await redis_conn->async_exec(redis_req, redis::ignore, net::deferred);
 
       co_return json_response(std::move(req), {{"user_id", user_id}});
@@ -430,24 +430,24 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
       co_await redis_conn->async_exec(redis_req, redis_resp_id, net::deferred);
       if (std::get<0>(redis_resp_id).value()) {
         const auto &my_follow = std::get<0>(redis_resp_id).value().value();
-        std::stringstream ss("TS.MREVRANGE - + FILTER userid=(");
+        std::stringstream ss;
+        ss << "user_id=(";
         for (int i = 0; i < my_follow.size(); i++) {
-          ss << my_follow[i] << (i != my_follow.size() - 1 ? "," : "");
+          ss << my_follow[i] << (i != my_follow.size() - 1 ? "," : ")");
         }
-        ss << ") COUNT " << page_size;
         redis_req.clear();
-        redis_req.push(ss.str());
+        redis_req.push("TS.MREVRANGE", "-", "+", "COUNT", page_size, "FILTER", ss.str());
         redis::generic_response resp_post_id;
         co_await redis_conn->async_exec(redis_req, resp_post_id, net::deferred);
         if (resp_post_id.has_value()) {
           std::vector<std::string_view> post_ids(1, "posts");
           for (const auto &node : resp_post_id.value()) {
-            if (node.data_type == redis::resp3::type::simple_string) {
+            if (node.data_type == redis::resp3::type::doublean) {
               post_ids.emplace_back(node.value);
             }
           }
           redis_req.clear();
-          redis_req.push_range("HMGET", post_ids);
+          redis_req.push_range("HMGET", post_ids.begin(), post_ids.end());
           redis::response<std::optional<std::vector<std::string>>> resp_content;
           co_await redis_conn->async_exec(redis_req, resp_content,
                                           net::deferred);
@@ -538,7 +538,8 @@ auto do_session(beast::tcp_stream stream, redis::config redis_cfg,
   auto executor = co_await net::this_coro::executor;
 
   auto redis_conn = std::make_shared<redis::connection>(executor);
-  redis_conn->async_run(redis_cfg, {}, net::consign(net::detached, redis_conn));
+  redis_conn->async_run(redis_cfg, {redis::logger::level::err},
+                        net::consign(net::detached, redis_conn));
   redis::request redis_req;
   redis::response<std::string> redis_resp;
 
@@ -568,7 +569,7 @@ auto do_session(beast::tcp_stream stream, redis::config redis_cfg,
   redis_conn->cancel();
   co_await mysql_conn->async_close();
   // Send a TCP shutdown
-  stream.socket().shutdown(net::ip::tcp::socket::shutdown_send);
+  stream.socket().shutdown(net::ip::tcp::socket::shutdown_both);
 
   // At this point the connection is closed gracefully
   // we ignore the error because the client might have
