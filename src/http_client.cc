@@ -40,9 +40,6 @@ auto do_session(std::string_view host, std::string_view port,
   // Look up the domain name
   auto const results = co_await resolver.async_resolve(host, port);
 
-  // Set the timeout.
-  stream.expires_after(std::chrono::seconds(30));
-
   // Make the connection on the IP address we get from a lookup
   co_await stream.async_connect(results);
 
@@ -51,6 +48,7 @@ auto do_session(std::string_view host, std::string_view port,
   req.set(http::field::host, host);
   req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
   req.set(http::field::content_type, "application/json");
+  req.keep_alive(false);
   req.body() = json::serialize(body);
   req.prepare_payload();
 
@@ -75,6 +73,7 @@ auto do_session(std::string_view host, std::string_view port,
   // Gracefully close the socket
   beast::error_code ec;
   stream.socket().shutdown(net::ip::tcp::socket::shutdown_both, ec);
+  stream.close();
 
   // not_connected happens sometimes
   // so don't bother reporting it.

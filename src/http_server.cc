@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/bind_executor.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
@@ -14,6 +15,7 @@
 #include <boost/mysql.hpp>
 #include <boost/mysql/diagnostics.hpp>
 #include <boost/redis.hpp>
+#include <boost/redis/request.hpp>
 #include <boost/redis/response.hpp>
 #include <boost/redis/src.hpp> // REQUIRED to compile
 #include <cstdint>
@@ -127,6 +129,14 @@ template <class Body, class Allocator>
 auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
                     mysql_conn_ptr mysql_conn, redis_conn_ptr redis_conn)
     -> net::awaitable<http::message_generator> {
+
+  /* Redis connection needs to be executed on the same thread that created it,
+     otherwise the connection may hang. This can be done by binding the
+     execution with the connection's executor (which is its spawning coroutine's
+     executor). I am not entirely sure about its effect, but at least it works
+     in multi-threaded environments. */
+  auto redis_executor = redis_conn->get_executor();
+  auto redis_token = net::bind_executor(redis_executor, net::deferred);
   // Returns a bad request response
   auto const bad_request = [&req](beast::string_view why) {
     http::response<http::string_body> res{http::status::bad_request,
@@ -177,8 +187,6 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
     return req.target().starts_with(url) && req.method() == method;
   };
 
-  using ts_revrange_return_type = std::vector<std::pair<int, std::string>>;
-
   try {
     // 用户注册 POST
     if (api_match("/api/register/", http::verb::post)) {
@@ -203,8 +211,9 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
       redis::request redis_req;
       std::string id_str(std::to_string(user_id));
       redis_req.push("SET", username, user_id);
-      redis_req.push("TS.CREATE", "post_id:" + id_str, "LABELS", "user_id", id_str);
-      co_await redis_conn->async_exec(redis_req, redis::ignore, net::deferred);
+      redis_req.push("TS.CREATE", "post_id:" + id_str, "LABELS", "user_id",
+                     id_str);
+      co_await redis_conn->async_exec(redis_req, redis::ignore, redis_token);
 
       co_return json_response(std::move(req), {{"user_id", user_id}});
     }
@@ -239,13 +248,12 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
       redis::response<std::optional<int64_t>> redis_resp;
       mysql::results result;
       redis_req.push("GET", follow_name);
-      co_await redis_conn->async_exec(redis_req, redis_resp, net::deferred);
+      co_await redis_conn->async_exec(redis_req, redis_resp, redis_token);
       if (std::get<0>(redis_resp).value()) {
         redis_req.clear();
         int follow_id = std::get<0>(redis_resp).value().value();
         redis_req.push("SADD", "follow:" + std::to_string(user_id), follow_id);
-        co_await redis_conn->async_exec(redis_req, redis::ignore,
-                                        net::deferred);
+        co_await redis_conn->async_exec(redis_req, redis::ignore, redis_token);
 
         auto stmt = co_await mysql_conn->async_prepare_statement(
             "INSERT INTO follows (follower_id, followee_id) VALUES (?, ?)");
@@ -274,7 +282,7 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
       redis_req.push("SMEMBERS", key);
       // redis_req.push("EXPIRE", key, 60);
 
-      co_await redis_conn->async_exec(redis_req, redis_resp, net::deferred);
+      co_await redis_conn->async_exec(redis_req, redis_resp, redis_token);
       json::array all_follows;
       if (std::get<0>(redis_resp).value()) {
         const auto &result = std::get<0>(redis_resp).value().value();
@@ -329,7 +337,7 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
       redis_req.push("HSET", "posts", post_id, content);
       redis_req.push("TS.ADD", "post_id:" + std::to_string(user_id), post_id,
                      post_id);
-      co_await redis_conn->async_exec(redis_req, redis::ignore, net::deferred);
+      co_await redis_conn->async_exec(redis_req, redis::ignore, redis_token);
 
       co_return json_response(req, {{"post_id", post_id}});
     }
@@ -352,7 +360,7 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
         redis::request redis_req;
         redis::response<std::optional<std::string>> resp_id;
         redis_req.push("GET", username);
-        co_await redis_conn->async_exec(redis_req, resp_id, net::deferred);
+        co_await redis_conn->async_exec(redis_req, resp_id, redis_token);
         if (std::get<0>(resp_id).value()) {
           user_id = std::stoi(std::get<0>(resp_id).value().value());
         } else {
@@ -372,7 +380,7 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
       redis::generic_response redis_resp_id;
       redis_req.push("TS.REVRANGE", "post_id:" + std::to_string(user_id), "-",
                      "+");
-      co_await redis_conn->async_exec(redis_req, redis_resp_id, net::deferred);
+      co_await redis_conn->async_exec(redis_req, redis_resp_id, redis_token);
       json::array post_hist;
       if (redis_resp_id.has_value()) {
         std::vector<std::string_view> post_ids(1, "posts");
@@ -386,7 +394,7 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
         redis::response<std::optional<std::vector<std::string>>>
             redis_resp_post;
         co_await redis_conn->async_exec(redis_req, redis_resp_post,
-                                        net::deferred);
+                                        redis_token);
         if (std::get<0>(redis_resp_post).value()) {
           const auto &posts = std::get<0>(redis_resp_post).value().value();
           post_hist = json::array(posts.begin(), posts.end());
@@ -427,7 +435,7 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
       redis::request redis_req;
       redis_req.push("SMEMBERS", "follow:" + std::to_string(user_id));
       redis::response<std::optional<std::vector<int64_t>>> redis_resp_id;
-      co_await redis_conn->async_exec(redis_req, redis_resp_id, net::deferred);
+      co_await redis_conn->async_exec(redis_req, redis_resp_id, redis_token);
       if (std::get<0>(redis_resp_id).value()) {
         const auto &my_follow = std::get<0>(redis_resp_id).value().value();
         std::stringstream ss;
@@ -436,9 +444,10 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
           ss << my_follow[i] << (i != my_follow.size() - 1 ? "," : ")");
         }
         redis_req.clear();
-        redis_req.push("TS.MREVRANGE", "-", "+", "COUNT", page_size, "FILTER", ss.str());
+        redis_req.push("TS.MREVRANGE", "-", "+", "COUNT", page_size, "FILTER",
+                       ss.str());
         redis::generic_response resp_post_id;
-        co_await redis_conn->async_exec(redis_req, resp_post_id, net::deferred);
+        co_await redis_conn->async_exec(redis_req, resp_post_id, redis_token);
         if (resp_post_id.has_value()) {
           std::vector<std::string_view> post_ids(1, "posts");
           for (const auto &node : resp_post_id.value()) {
@@ -449,8 +458,7 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
           redis_req.clear();
           redis_req.push_range("HMGET", post_ids.begin(), post_ids.end());
           redis::response<std::optional<std::vector<std::string>>> resp_content;
-          co_await redis_conn->async_exec(redis_req, resp_content,
-                                          net::deferred);
+          co_await redis_conn->async_exec(redis_req, resp_content, redis_token);
           if (std::get<0>(resp_content).value()) {
             const auto &contents = std::get<0>(resp_content).value().value();
             json::array posts(contents.begin(), contents.end());
@@ -548,7 +556,7 @@ auto do_session(beast::tcp_stream stream, redis::config redis_cfg,
   // Connect to the server
   co_await mysql_conn->async_connect(mysql_params);
   bool keep_alive;
-  std::string redis_buffer;
+
   do {
     // Set the timeout.
     stream.expires_after(std::chrono::seconds(30));
@@ -569,7 +577,8 @@ auto do_session(beast::tcp_stream stream, redis::config redis_cfg,
   redis_conn->cancel();
   co_await mysql_conn->async_close();
   // Send a TCP shutdown
-  stream.socket().shutdown(net::ip::tcp::socket::shutdown_both);
+  stream.socket().shutdown(net::ip::tcp::socket::shutdown_send);
+  stream.close();
 
   // At this point the connection is closed gracefully
   // we ignore the error because the client might have
@@ -651,21 +660,35 @@ auto main(int argc, char *argv[]) -> int {
   buffer << fs.rdbuf();
   json::object config = json::parse(buffer.str()).as_object();
 
+#ifndef THREAD_LOCAL_IO_CONTEXT
   // The io_context is required for all I/O
-  net::io_context ioc{threads};
-  net::thread_pool s;
+  net::io_context ioc(threads);
 
   // Spawn a listening port
   net::co_spawn(ioc, do_listen(net::ip::tcp::endpoint{address, port}, config),
                 net::detached);
+  auto func = [&ioc]() { ioc.run(); };
+#else
+  auto func = [&config, &threads, &address, &port]() {
+    // The io_context is required for all I/O
+    net::io_context ioc(threads);
 
+    // Spawn a listening port
+    net::co_spawn(ioc, do_listen(net::ip::tcp::endpoint{address, port}, config),
+                  net::detached);
+    ioc.run();
+  };
+#endif
   // Run the I/O service on the requested number of threads
   std::vector<std::thread> v;
-  v.reserve(threads - 1);
-  for (auto i = threads - 1; i > 0; --i) {
-    v.emplace_back([&ioc] { ioc.run(); });
+  v.reserve(threads);
+  for (auto i = threads; i > 0; --i) {
+    v.emplace_back(func);
   }
-  ioc.run();
+
+  for (auto i = 0; i < threads; ++i) {
+    v[i].join();
+  }
 
   return EXIT_SUCCESS;
 }
