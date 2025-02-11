@@ -145,7 +145,7 @@ auto client::user_login(string_view username, string_view password) -> int {
 }
 
 auto client::_get_posts(int user_id, string_view username)
-    -> result<std::vector<std::string>> {
+    -> result<std::vector<json::object>> {
   json::object body;
   if (user_id != -1) {
     body["user_id"] = user_id;
@@ -155,10 +155,14 @@ auto client::_get_posts(int user_id, string_view username)
   json::object resp = request("/api/post/", http::verb::get, std::move(body));
   if (resp.contains("posts")) {
     const json::array &arr = resp.at("posts").as_array();
-    std::vector<std::string> res;
+    std::vector<json::object> res;
     res.reserve(arr.size());
     std::for_each(arr.begin(), arr.end(), [&res](const json::value &v) {
-      res.emplace_back(v.as_string());
+      if (v.is_string()) {
+        res.emplace_back(json::parse(v.as_string()).as_object());
+      } else {
+        res.emplace_back(v.as_object());
+      }
     });
     return {0, res};
   }
@@ -202,15 +206,19 @@ auto client::get_follow_list() -> result<std::vector<int>> {
   return {kFailed};
 }
 
-auto client::get_feed() -> result<std::vector<std::string>> {
+auto client::get_feed() -> result<std::vector<json::object>> {
   REQUIRE_LOGIN({kNotLoggedIn});
   json::object resp = request("/api/feed/" + get_id_str(), http::verb::get);
   if (resp.contains("posts")) {
     const json::array &arr = resp.at("posts").as_array();
-    std::vector<std::string> res;
+    std::vector<json::object> res;
     res.reserve(arr.size());
     std::for_each(arr.begin(), arr.end(), [&res](const json::value &v) {
-      res.emplace_back(v.as_string());
+      if (v.is_string()) {
+        res.emplace_back(json::parse(v.as_string()).as_object());
+      } else if (v.is_object()) {
+        res.emplace_back(v.as_object());
+      }
     });
     return {0, res};
   }

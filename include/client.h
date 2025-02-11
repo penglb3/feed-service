@@ -39,17 +39,14 @@ class client {
   }
 
   auto _get_posts(int user_id, std::string_view username = {})
-      -> result<std::vector<std::string>>;
+      -> result<std::vector<boost::json::object>>;
 
 public:
   enum status_code { kFailed = -1, kNotLoggedIn = -2 };
 
-  inline auto get_posts(int user_id) -> result<std::vector<std::string>> {
-    return _get_posts(user_id);
-  };
+  inline auto get_posts(int user_id) { return _get_posts(user_id); };
 
-  inline auto get_posts(std::string_view username)
-      -> result<std::vector<std::string>> {
+  inline auto get_posts(std::string_view username) {
     return _get_posts(-1, username);
   }
 
@@ -63,5 +60,5 @@ public:
   auto follow_user(string_view follow_name) -> int;
   auto publish_post(string_view post_content) -> int;
   auto get_follow_list() -> result<std::vector<int>>;
-  auto get_feed() -> result<std::vector<std::string>>;
+  auto get_feed() -> result<std::vector<boost::json::object>>;
 };

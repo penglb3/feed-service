@@ -6,7 +6,7 @@ using std::endl;
 
 #define ASSERT(x, y)                                                           \
   if ((x) != (y)) {                                                            \
-    cout << "Line: " << __LINE__ << " " #x "!=" #y "\n";                  \
+    cout << "Line: " << __LINE__ << " " #x "!=" #y "\n";                       \
     abort();                                                                   \
   }
 
@@ -21,7 +21,7 @@ auto main() -> int {
   auto posts = c1.get_posts("user1");
   ASSERT(posts.success(), true);
   for (int i = 0; i < posts.value().size(); i++) {
-    printf("#%d: %s\n", i, posts.value().at(i).c_str());
+    std::cout << "#" << i << ": " << posts.value()[i] << std::endl;
   }
 
   ASSERT(c2.user_register("user2", "pass2"), 2);
@@ -29,7 +29,7 @@ auto main() -> int {
   ASSERT(c2.follow_user("user1"), 0);
 
   ASSERT(c3.user_register("user3", "pass3"), 3);
-  ASSERT(c2.publish_post("hello user3"), 0);
+  ASSERT(c3.publish_post("hello user3"), 0);
   ASSERT(c3.follow_user("user1"), 0);
 
   ASSERT(c4.user_register("user4", "pass4"), 4);
@@ -39,7 +39,7 @@ auto main() -> int {
   ASSERT(c4.follow_user("user3"), 0);
   auto follow_list = c4.get_follow_list();
   ASSERT(follow_list.success(), true);
-  for (auto id: follow_list.value()) {
+  for (auto id : follow_list.value()) {
     printf("%d,", id);
   }
   puts("");
@@ -47,6 +47,6 @@ auto main() -> int {
   posts = c4.get_feed();
   ASSERT(posts.success(), true);
   for (int i = 0; i < posts.value().size(); i++) {
-    printf("#%d: %s\n", i, posts.value()[i].c_str());
+    std::cout << "#" << i << ": " << posts.value()[i] << std::endl;
   }
 }
