@@ -231,7 +231,7 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
 
       redis::request redis_req;
       redis::generic_response redis_resp_id;
-      redis_req.push("TS.REVRANGE", "post_id:" + std::to_string(user_id), "-",
+      redis_req.push("TS.RANGE", "post_id:" + std::to_string(user_id), "-",
                      "+");
       co_await redis_conn->async_exec(redis_req, redis_resp_id, redis_token);
       json::array post_hist;
@@ -417,7 +417,6 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
       co_return json_response(req, {{"post_id", post_id}});
     }
 
-
     // 获取time时间点前最近n个订阅流
     if (api_match("/api/feed", http::verb::get)) {
       int user_id = std::stoi(req.target().substr(strlen("/api/feed/")));
@@ -459,8 +458,8 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
           ss << my_follow[i] << (i != my_follow.size() - 1 ? "," : ")");
         }
         redis_req.clear();
-        redis_req.push("TS.MREVRANGE", "-", max_time, "COUNT", page_size,
-                       "FILTER", ss.str());
+        redis_req.push("TS.MRANGE", "-", max_time, "COUNT", page_size, "FILTER",
+                       ss.str());
         redis::generic_response resp_post_id;
         co_await redis_conn->async_exec(redis_req, resp_post_id, redis_token);
         if (resp_post_id.has_value() && !resp_post_id.value().empty()) {

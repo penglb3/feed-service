@@ -32,10 +32,10 @@ For example: `build/feed-service 0.0.0.0 12345 conf/config.json 8`.
 ## Testing
 Run `build/basic_function`, a print of 4 posts finally is expected. Exaple output:
 ```
-#0: {"id":2,"user_id":1,"content":"another post!","created_at":1741087658670132}
-#1: {"id":1,"user_id":1,"content":"hello user1","created_at":1741087658617241}
-#2: {"id":3,"user_id":2,"content":"hello user2","created_at":1741087658772551}
-#3: {"id":4,"user_id":3,"content":"hello user3","created_at":1741087658914564}
+#0: {"id":1,"user_id":1,"content":"hello user1","created_at":1741109720521043}
+#1: {"id":2,"user_id":1,"content":"another post!","created_at":1741109720561550}
+#2: {"id":3,"user_id":2,"content":"hello user2","created_at":1741109720668543}
+#3: {"id":4,"user_id":3,"content":"hello user3","created_at":1741109720796941}
 ```
 
 ## API List
