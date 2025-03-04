@@ -1,4 +1,7 @@
+#include "common/config.h"
+#include "common/server_certificate.hpp"
 #include <algorithm>
+#include <boost/asio/as_tuple.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/co_spawn.hpp>
@@ -6,9 +9,12 @@
 #include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ssl/context.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/thread_pool.hpp>
 #include <boost/beast/core.hpp>
+#include <boost/beast/core/error.hpp>
+#include <boost/beast/core/tcp_stream.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
 #include <boost/config.hpp>
@@ -41,76 +47,6 @@ namespace json = boost::json;
 
 using mysql_conn_ptr = std::shared_ptr<mysql::any_connection>;
 using redis_conn_ptr = std::shared_ptr<redis::connection>;
-
-// Return a reasonable mime type based on the extension of a file.
-auto mime_type(beast::string_view path) -> beast::string_view {
-  using beast::iequals;
-  auto const ext = [&path] {
-    auto const pos = path.rfind(".");
-    if (pos == beast::string_view::npos) {
-      return beast::string_view{};
-    }
-    return path.substr(pos);
-  }();
-  if (iequals(ext, ".htm"))
-    return "text/html";
-  if (iequals(ext, ".html"))
-    return "text/html";
-  if (iequals(ext, ".php"))
-    return "text/html";
-  if (iequals(ext, ".css"))
-    return "text/css";
-  if (iequals(ext, ".txt"))
-    return "text/plain";
-  if (iequals(ext, ".js"))
-    return "application/javascript";
-  if (iequals(ext, ".json"))
-    return "application/json";
-  if (iequals(ext, ".xml"))
-    return "application/xml";
-  if (iequals(ext, ".swf"))
-    return "application/x-shockwave-flash";
-  if (iequals(ext, ".flv"))
-    return "video/x-flv";
-  if (iequals(ext, ".png"))
-    return "image/png";
-  if (iequals(ext, ".jpe"))
-    return "image/jpeg";
-  if (iequals(ext, ".jpeg"))
-    return "image/jpeg";
-  if (iequals(ext, ".jpg"))
-    return "image/jpeg";
-  if (iequals(ext, ".gif"))
-    return "image/gif";
-  if (iequals(ext, ".bmp"))
-    return "image/bmp";
-  if (iequals(ext, ".ico"))
-    return "image/vnd.microsoft.icon";
-  if (iequals(ext, ".tiff"))
-    return "image/tiff";
-  if (iequals(ext, ".tif"))
-    return "image/tiff";
-  if (iequals(ext, ".svg"))
-    return "image/svg+xml";
-  if (iequals(ext, ".svgz"))
-    return "image/svg+xml";
-  return "application/text";
-}
-
-// Append an HTTP rel-path to a local filesystem path.
-// The returned path is normalized for the platform.
-auto path_cat(beast::string_view base, beast::string_view path) -> std::string {
-  if (base.empty()) {
-    return std::string(path);
-  }
-  std::string result(base);
-  char constexpr path_separator = '/';
-  if (result.back() == path_separator) {
-    result.resize(result.size() - 1);
-  }
-  result.append(path.data(), path.size());
-  return result;
-}
 
 template <class Body, class Allocator>
 inline auto
@@ -155,38 +91,28 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
   };
 
   // Returns a not found response
-  auto const not_found = [&req](beast::string_view target) {
+  auto const not_implemented = [&req](beast::string_view target) {
     http::response<http::string_body> res{http::status::not_found,
                                           req.version()};
     res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
     res.set(http::field::content_type, "text/html");
     res.keep_alive(req.keep_alive());
-    res.body() = "The resource '" + std::string(target) + "' was not found.";
-    res.prepare_payload();
-    return res;
-  };
-
-  // Returns a server error response
-  auto const server_error = [&req](beast::string_view what) {
-    http::response<http::string_body> res{http::status::internal_server_error,
-                                          req.version()};
-    res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
-    res.set(http::field::content_type, "text/html");
-    res.keep_alive(req.keep_alive());
-    res.body() = "An error occurred: '" + std::string(what) + "'";
+    res.body() = "The API '" + std::string(target) + "' was not found.";
     res.prepare_payload();
     return res;
   };
 
   // Make sure we can handle the method
   if (req.method() != http::verb::get && req.method() != http::verb::post &&
-      req.method() != http::verb::head)
+      req.method() != http::verb::head) {
     co_return bad_request("Unknown HTTP-method");
+  }
 
   // Request path must be absolute and not contain "..".
   if (req.target().empty() || req.target()[0] != '/' ||
-      req.target().find("..") != beast::string_view::npos)
+      req.target().find("..") != beast::string_view::npos) {
     co_return bad_request("Illegal request-target");
+  }
 
   auto api_match = [&req](const std::string_view url, http::verb method) {
     return req.target().starts_with(url) && req.method() == method;
@@ -529,60 +455,29 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
                             http::status::internal_server_error);
   }
 
-  // Build the path to the requested file
-  std::string path = path_cat(".", req.target());
-  if (req.target().back() == '/')
-    path.append("index.html");
-
-  // Attempt to open the file
-  beast::error_code ec;
-  http::file_body::value_type body;
-  body.open(path.c_str(), beast::file_mode::scan, ec);
-
-  // Handle the case where the file doesn't exist
-  if (ec == beast::errc::no_such_file_or_directory)
-    co_return not_found(req.target());
-
-  // Handle an unknown error
-  if (ec)
-    co_return server_error(ec.message());
-
-  // Cache the size since we need it after the move
-  auto const size = body.size();
-
-  // Respond to HEAD request
-  if (req.method() == http::verb::head) {
-    http::response<http::empty_body> res{http::status::ok, req.version()};
-    res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
-    res.set(http::field::content_type, mime_type(path));
-    res.content_length(size);
-    res.keep_alive(req.keep_alive());
-    co_return res;
-  }
-
-  // Respond to GET request
-  http::response<http::file_body> res{
-      std::piecewise_construct, std::make_tuple(std::move(body)),
-      std::make_tuple(http::status::ok, req.version())};
-  res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
-  res.set(http::field::content_type, mime_type(path));
-  res.content_length(size);
-  res.keep_alive(req.keep_alive());
-  co_return res;
+  co_return not_implemented(req.target());
 }
 
+#ifdef FEED_USE_SSL
+using stream_type = net::ssl::stream<beast::tcp_stream>;
+#else
+using stream_type = beast::tcp_stream;
+#endif
+
 // Handles an HTTP server connection
-auto do_session(beast::tcp_stream stream, redis::config redis_cfg,
+auto do_session(stream_type stream, redis::config redis_cfg,
                 mysql::connect_params mysql_params) -> net::awaitable<void> {
   // This buffer is required to persist across reads
   beast::flat_buffer buffer;
   auto executor = co_await net::this_coro::executor;
 
+#ifdef FEED_USE_SSL
+  co_await stream.async_handshake(net::ssl::stream_base::server);
+#endif
+
   auto redis_conn = std::make_shared<redis::connection>(executor);
   redis_conn->async_run(redis_cfg, {redis::logger::level::err},
                         net::consign(net::detached, redis_conn));
-  redis::request redis_req;
-  redis::response<std::string> redis_resp;
 
   auto mysql_conn = std::make_shared<mysql::any_connection>(executor);
 
@@ -592,11 +487,19 @@ auto do_session(beast::tcp_stream stream, redis::config redis_cfg,
 
   do {
     // Set the timeout.
+#ifdef FEED_USE_SSL
+    beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(30));
+#else
     stream.expires_after(std::chrono::seconds(30));
+#endif
 
     // Read a request
     http::request<http::string_body> req;
-    co_await http::async_read(stream, buffer, req);
+    auto [ec, _] =
+        co_await http::async_read(stream, buffer, req, net::as_tuple);
+    if (ec) {
+      break;
+    }
 
     // Handle the request
     http::message_generator msg =
@@ -604,14 +507,22 @@ auto do_session(beast::tcp_stream stream, redis::config redis_cfg,
     keep_alive = msg.keep_alive();
 
     // Send the response
-    co_await beast::async_write(stream, std::move(msg));
+    std::tie(ec, _) =
+        co_await beast::async_write(stream, std::move(msg), net::as_tuple);
+    if (ec) {
+      break;
+    }
   } while (keep_alive);
 
   redis_conn->cancel();
   co_await mysql_conn->async_close();
-  // Send a TCP shutdown
+// Send a TCP shutdown
+#ifdef FEED_USE_SSL
+  co_await stream.async_shutdown();
+#else
   stream.socket().shutdown(net::ip::tcp::socket::shutdown_send);
   stream.close();
+#endif
 
   // At this point the connection is closed gracefully
   // we ignore the error because the client might have
@@ -663,13 +574,19 @@ auto do_listen(net::ip::tcp::endpoint endpoint, json::object config)
   auto acceptor = net::ip::tcp::acceptor{executor, endpoint};
 
   auto [redis_cfg, mysql_params] = generate_config(config);
+  net::ssl::context ctx(net::ssl::context::tlsv13);
+  load_server_certificate(ctx);
 
   for (;;) {
-    net::co_spawn(
-        executor,
-        do_session(beast::tcp_stream{co_await acceptor.async_accept()},
-                   redis_cfg, mysql_params),
-        net::detached);
+    net::co_spawn(executor,
+                  do_session(
+#ifdef FEED_USE_SSL
+                      stream_type{co_await acceptor.async_accept(), ctx},
+#else
+                      stream_type{co_await acceptor.async_accept()},
+#endif
+                      redis_cfg, mysql_params),
+                  net::detached);
   }
 }
 

@@ -35,7 +35,7 @@ load_server_certificate(boost::asio::ssl::context& ctx)
         openssl req -newkey rsa:2048 -nodes -keyout key.pem -x509 -days 10000 -out cert.pem -subj "/C=US/ST=CA/L=Los Angeles/O=Beast/CN=www.example.com"
     */
 
-    std::string const cert =
+    std::string_view const cert =
         "-----BEGIN CERTIFICATE-----\n"
         "MIIDlTCCAn2gAwIBAgIUOLxr3q7Wd/pto1+2MsW4fdRheCIwDQYJKoZIhvcNAQEL\n"
         "BQAwWjELMAkGA1UEBhMCVVMxCzAJBgNVBAgMAkNBMRQwEgYDVQQHDAtMb3MgQW5n\n"
@@ -59,7 +59,7 @@ load_server_certificate(boost::asio::ssl::context& ctx)
         "7356drqnCGY9\n"
         "-----END CERTIFICATE-----\n";
 
-    std::string const key =
+    std::string_view const key =
         "-----BEGIN PRIVATE KEY-----\n"
         "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCz0GwgnxSBhygx\n"
         "BdhTHGx5LDLIJSuIDJ6nMwZFvAjdhLnB/vOTLppr5MKxqQHEpYdyDYGD1noBoz4T\n"
@@ -89,7 +89,7 @@ load_server_certificate(boost::asio::ssl::context& ctx)
         "nOMOU6XI4lO9Xge/QDEN4Y2R\n"
         "-----END PRIVATE KEY-----\n";
 
-    std::string const dh =
+    std::string_view const dh =
         "-----BEGIN DH PARAMETERS-----\n"
         "MIIBCAKCAQEArzQc5mpm0Fs8yahDeySj31JZlwEphUdZ9StM2D8+Fo7TMduGtSi+\n"
         "/HRWVwHcTFAgrxVdm+dl474mOUqqaz4MpzIb6+6OVfWHbQJmXPepZKyu4LgUPvY/\n"

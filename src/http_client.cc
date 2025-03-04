@@ -1,11 +1,15 @@
 #include "client.h"
+#include "common/root_certificate.hpp"
+#include "common/server_certificate.hpp"
 #include <algorithm>
 #include <boost/archive/iterators/base64_from_binary.hpp>
 #include <boost/archive/iterators/binary_from_base64.hpp>
 #include <boost/archive/iterators/transform_width.hpp>
+#include <boost/asio/as_tuple.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/ssl/stream.hpp>
 #include <boost/asio/use_future.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
@@ -29,19 +33,46 @@ namespace http = beast::http;
 namespace net = boost::asio;
 namespace json = boost::json;
 
+#ifdef FEED_USE_SSL
+using stream_type = net::ssl::stream<beast::tcp_stream>;
+#else
+using stream_type = beast::tcp_stream;
+#endif
+
 // Performs an HTTP GET and prints the response
 auto do_session(std::string_view host, std::string_view port,
                 std::string_view target, http::verb method, json::object body)
     -> net::awaitable<std::string> {
   auto executor = co_await net::this_coro::executor;
   auto resolver = net::ip::tcp::resolver{executor};
-  auto stream = beast::tcp_stream{executor};
 
+#ifdef FEED_USE_SSL
+  net::ssl::context ctx(net::ssl::context::tlsv13);
+  load_server_certificate(ctx);
+  // ctx.use_certificate_chain_file("server.crt");
+  // ctx.use_private_key_file("client.key",
+  //                          boost::asio::ssl::context::file_format::pem);
+  // ctx.use_tmp_dh_file("dh.pem");
+  stream_type stream{executor, ctx};
+  if(! SSL_set_tlsext_host_name(stream.native_handle(), host.data()))
+  {
+      throw beast::system_error(
+          static_cast<int>(::ERR_get_error()),
+          net::error::get_ssl_category());
+  }
+  stream.set_verify_callback(ssl::host_name_verification(host.data()));
   // Look up the domain name
   auto const results = co_await resolver.async_resolve(host, port);
+  co_await beast::get_lowest_layer(stream).async_connect(results);
 
+  co_await stream.async_handshake(net::ssl::stream_base::client);
+#else
+  stream_type stream = beast::tcp_stream{executor};
+  // Look up the domain name
+  auto const results = co_await resolver.async_resolve(host, port);
   // Make the connection on the IP address we get from a lookup
   co_await stream.async_connect(results);
+#endif
 
   // Set up an HTTP GET request message
   http::request<http::string_body> req{method, target, 11};
@@ -53,10 +84,13 @@ auto do_session(std::string_view host, std::string_view port,
   req.prepare_payload();
 
   // Set the timeout.
+#ifdef FEED_USE_SSL
+  beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(30));
+#else
   stream.expires_after(std::chrono::seconds(30));
-
+#endif
   // Send the HTTP request to the remote host
-  co_await http::async_write(stream, req);
+  co_await http::async_write(stream, req, net::as_tuple);
 
   // This buffer is used for reading and must be persisted
   beast::flat_buffer buffer;
@@ -72,8 +106,12 @@ auto do_session(std::string_view host, std::string_view port,
 
   // Gracefully close the socket
   beast::error_code ec;
-  stream.socket().shutdown(net::ip::tcp::socket::shutdown_both, ec);
+#ifdef FEED_USE_SSL
+  std::tie(ec) = co_await stream.async_shutdown(net::as_tuple);
+#else
+  stream.socket().shutdown(net::ip::tcp::socket::shutdown_send, ec);
   stream.close();
+#endif
 
   // not_connected happens sometimes
   // so don't bother reporting it.

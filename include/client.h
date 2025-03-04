@@ -3,6 +3,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "common/config.h"
 
 template <typename T>
 struct result {
