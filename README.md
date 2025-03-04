@@ -2,19 +2,40 @@
 
 ## Requirements
 - Ubuntu 22.04
-- GCC 11
+- GCC >= 11 (we use c++20 coroutine)
 - CMake >= 3.18
 - Boost >= 1.84.0
 
 ## Install
 ### Install boost
-We use boost.mysql and boost.redis to connect to mysql and redis.
+This project relies on many submodules of boost (json, redis, mysql, asio for async framework & network, beast for http).
 ```bash
 wget https://archives.boost.io/release/1.87.0/source/boost_1_87_0.tar.gz
 tar -xzf boost_1_87_0.tar.gz
 cd boost_1_87_0
 ./bootstrap.sh
 sudo ./b2 install
+```
+
+## Building
+`cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build`
+
+## Using
+### Client side
+Include `include/client.h` and compile your app with `src/http_client.cc`
+
+### Server side
+Run `build/feed-service <listen_ip> <listen_port> <config_file> <num_of_threads>`. See the `conf/config.json` for all configurable options w.r.t. MySQL and Redis.
+
+For example: `build/feed-service 0.0.0.0 12345 conf/config.json 8`.
+
+## Testing
+Run `build/basic_function`, a print of 4 posts finally is expected. Exaple output:
+```
+#0: {"id":2,"user_id":1,"content":"another post!","created_at":1741087658670132}
+#1: {"id":1,"user_id":1,"content":"hello user1","created_at":1741087658617241}
+#2: {"id":3,"user_id":2,"content":"hello user2","created_at":1741087658772551}
+#3: {"id":4,"user_id":3,"content":"hello user3","created_at":1741087658914564}
 ```
 
 ## API List
@@ -32,10 +53,12 @@ sudo ./b2 install
 - [x] Redis connection, async
 - [x] Multi-threading
 - [x] API and processing logic
+- [x] SSL handshake
+- [x] JSON Web Token for user id authorization
 - [x] Testing
   - [x] Basic functionality
   - [ ] Smoke test / Error handling
   - [ ] Stress test
-- [ ] Connection pool
+- [ ] Reusing established network connection
+- [ ] Connection pool for MySQL and Redis
 - [ ] Distributed service
-- [ ] Micro-service + Message Queue

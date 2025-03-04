@@ -29,10 +29,12 @@ if(COMPILER_SUPPORTS_FLTO)
   endif()
 endif()
 
+# add_subdirectory(third_party/jwt-cpp)
+
 add_executable(echo_server src/echo_server.cc)
 target_include_directories(echo_server PUBLIC include)
 add_executable(feed-service src/http_server.cc)
-target_include_directories(feed-service PUBLIC include)
+target_include_directories(feed-service PUBLIC include third_party/jwt-cpp/include)
 target_link_libraries(echo_server uring)
 target_link_libraries(feed-service Boost::charconv Threads::Threads OpenSSL::Crypto OpenSSL::SSL Boost::json)
 

@@ -39,9 +39,12 @@ using stream_type = net::ssl::stream<beast::tcp_stream>;
 using stream_type = beast::tcp_stream;
 #endif
 
+using std::string;
+using std::string_view;
+
 // Performs an HTTP GET and prints the response
-auto do_session(std::string_view host, std::string_view port,
-                std::string_view target, http::verb method, json::object body)
+auto do_session(string_view host, string_view port, const string &token,
+                string_view target, http::verb method, json::object body)
     -> net::awaitable<std::string> {
   auto executor = co_await net::this_coro::executor;
   auto resolver = net::ip::tcp::resolver{executor};
@@ -54,11 +57,9 @@ auto do_session(std::string_view host, std::string_view port,
   //                          boost::asio::ssl::context::file_format::pem);
   // ctx.use_tmp_dh_file("dh.pem");
   stream_type stream{executor, ctx};
-  if(! SSL_set_tlsext_host_name(stream.native_handle(), host.data()))
-  {
-      throw beast::system_error(
-          static_cast<int>(::ERR_get_error()),
-          net::error::get_ssl_category());
+  if (!SSL_set_tlsext_host_name(stream.native_handle(), host.data())) {
+    throw beast::system_error(static_cast<int>(::ERR_get_error()),
+                              net::error::get_ssl_category());
   }
   stream.set_verify_callback(ssl::host_name_verification(host.data()));
   // Look up the domain name
@@ -79,6 +80,9 @@ auto do_session(std::string_view host, std::string_view port,
   req.set(http::field::host, host);
   req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
   req.set(http::field::content_type, "application/json");
+  if (!token.empty()) {
+    req.set(http::field::authorization, "Bearer " + token);
+  }
   req.keep_alive(false);
   req.body() = json::serialize(body);
   req.prepare_payload();
@@ -130,8 +134,9 @@ auto client::request(string_view api, http::verb method,
   net::io_context ctx;
 
   // Launch the asynchronous operation
-  auto future = net::co_spawn(ctx, do_session(host_, port_, api, method, body),
-                              net::use_future);
+  auto future =
+      net::co_spawn(ctx, do_session(host_, port_, token_, api, method, body),
+                    net::use_future);
 
   // Run the I/O service. The call will return when
   // the operation is complete.
@@ -166,7 +171,8 @@ auto client::user_register(string_view username, string_view password) -> int {
                      {"password_hash", password_hash_base64(password)}});
   json::object resp =
       request("/api/register/", http::verb::post, std::move(body));
-  if (resp.contains("user_id")) {
+  if (resp.contains("user_id") && resp.contains("token")) {
+    token_ = resp.at("token").as_string();
     return user_id_ = resp.at("user_id").as_int64();
   }
   return kFailed;
@@ -176,7 +182,8 @@ auto client::user_login(string_view username, string_view password) -> int {
   json::object body({{"username", username},
                      {"password_hash", password_hash_base64(password)}});
   json::object resp = request("/api/login/", http::verb::post, std::move(body));
-  if (resp.contains("user_id")) {
+  if (resp.contains("user_id") && resp.contains("token")) {
+    token_ = resp.at("token").as_string();
     return user_id_ = resp.at("user_id").as_int64();
   }
   return kFailed;

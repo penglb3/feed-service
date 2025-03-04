@@ -1,5 +1,6 @@
 #include "common/config.h"
 #include "common/server_certificate.hpp"
+#include "jwt-cpp/traits/boost-json/traits.h"
 #include <algorithm>
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/awaitable.hpp>
@@ -16,6 +17,7 @@
 #include <boost/beast/core/error.hpp>
 #include <boost/beast/core/tcp_stream.hpp>
 #include <boost/beast/http.hpp>
+#include <boost/beast/http/field.hpp>
 #include <boost/beast/version.hpp>
 #include <boost/config.hpp>
 #include <boost/json.hpp>
@@ -33,6 +35,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <jwt-cpp/jwt.h>
 #include <memory>
 #include <string>
 #include <thread>
@@ -123,6 +126,22 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
   // Use a function so that it will be easier to extend.
   auto bypass_redis = [&bypass_redis_global]() { return bypass_redis_global; };
 
+  const std::string_view issuer("feed-service");
+  const jwt::algorithm::es256k jwt_algo(kEs256kPubKey.data(),
+                                        kEs256kPrivKey.data(), "", "");
+  using traits = jwt::traits::boost_json;
+  using claim = jwt::basic_claim<traits>;
+  auto create_jwt = [&issuer, &jwt_algo](const std::string &user_id) {
+    return jwt::create<traits>()
+        .set_issuer(issuer.data())
+        .set_type("JWT")
+        .set_id(user_id)
+        .set_issued_now()
+        .set_expires_in(std::chrono::seconds{36000})
+        .set_payload_claim("sample", claim(std::string{"test"}))
+        .sign(jwt_algo);
+  };
+
   try {
     // 用户注册 POST
     if (api_match("/api/register/", http::verb::post)) {
@@ -151,7 +170,8 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
                      id_str);
       co_await redis_conn->async_exec(redis_req, redis::ignore, redis_token);
 
-      co_return json_response(std::move(req), {{"user_id", user_id}});
+      co_return json_response(std::move(req), {{"user_id", user_id},
+                                               {"token", create_jwt(id_str)}});
     }
     if (api_match("/api/login/", http::verb::post)) {
       auto value = json::parse(req.body());
@@ -170,121 +190,11 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
         const auto &row = result.rows().at(0);
         if (row.at(1).as_string() == password_hash) {
           res["user_id"] = row.at(0).as_int64();
+          res["token"] = create_jwt(std::to_string(row.at(0).as_int64()));
         }
       }
       co_return json_response(req, res);
     }
-    // 关注用户 POST
-    if (api_match("/api/follow/", http::verb::post)) {
-      int user_id = std::stoi(req.target().substr(strlen("/api/follow/")));
-      std::string_view follow_name =
-          json::parse(req.body()).at("follow_name").as_string().c_str();
-
-      redis::request redis_req;
-      redis::response<std::optional<int64_t>> redis_resp;
-      mysql::results result;
-      redis_req.push("GET", follow_name);
-      co_await redis_conn->async_exec(redis_req, redis_resp, redis_token);
-      if (std::get<0>(redis_resp).value()) {
-        redis_req.clear();
-        int follow_id = std::get<0>(redis_resp).value().value();
-        redis_req.push("SADD", "follow:" + std::to_string(user_id), follow_id);
-        co_await redis_conn->async_exec(redis_req, redis::ignore, redis_token);
-
-        auto stmt = co_await mysql_conn->async_prepare_statement(
-            "INSERT INTO follows (follower_id, followee_id) VALUES (?, ?)");
-        co_await mysql_conn->async_execute(stmt.bind(user_id, follow_id),
-                                           result);
-        co_await mysql_conn->async_close_statement(stmt);
-      } else {
-        auto stmt = co_await mysql_conn->async_prepare_statement(
-            "INSERT INTO follows (follower_id, followee_id) "
-            "SELECT ?, user_id from users WHERE username = ?");
-        co_await mysql_conn->async_execute(stmt.bind(user_id, follow_name),
-                                           result);
-        co_await mysql_conn->async_close_statement(stmt);
-        // TODO(): non-existent username
-      }
-
-      co_return json_response(req, {{"status", "success"}});
-    }
-    // 获取关注列表 GET
-    if (api_match("/api/follow/", http::verb::get)) {
-      int user_id = std::stoi(req.target().substr(strlen("/api/follow/")));
-
-      redis::request redis_req;
-      redis::response<std::optional<std::vector<int64_t>>, int> redis_resp;
-      std::string key = "follow:" + std::to_string(user_id);
-      redis_req.push("SMEMBERS", key);
-      // redis_req.push("EXPIRE", key, 60);
-
-      co_await redis_conn->async_exec(redis_req, redis_resp, redis_token);
-      json::array all_follows;
-      if (!bypass_redis() && std::get<0>(redis_resp).value()) {
-        const auto &result = std::get<0>(redis_resp).value().value();
-        all_follows = json::array(result.begin(), result.end());
-      } else {
-        // Query MySQL
-        mysql::results mysql_result;
-        auto stmt = co_await mysql_conn->async_prepare_statement(
-            "SELECT followee_id from follows WHERE follower_id=?");
-        co_await mysql_conn->async_execute(stmt.bind(user_id), mysql_result);
-        co_await mysql_conn->async_close_statement(stmt);
-        all_follows.reserve(mysql_result.size());
-        for (const auto row : mysql_result.rows()) {
-          all_follows.push_back(row.at(0).as_int64());
-        }
-      }
-      co_return json_response(req, {{"followed", all_follows}});
-    }
-
-    // 发布动态 POST
-    if (api_match("/api/post/", http::verb::post)) {
-      int user_id;
-      std::string_view content;
-      auto local_time = std::chrono::time_point_cast<TimePoint::duration>(
-          Clock::now() + std::chrono::hours(8));
-      int64_t time_pt = local_time.time_since_epoch().count();
-      try {
-        auto value = json::parse(req.body()).as_object();
-        if (!value.contains("user_id")) {
-          co_return json_response(req, {{"error", "no user_id"}},
-                                  http::status::bad_request);
-        }
-        user_id = value.at("user_id").as_int64();
-        if (!value.contains("content")) {
-          co_return json_response(req, {{"error", "no content"}},
-                                  http::status::bad_request);
-        }
-        content = value.at("content").as_string().c_str();
-      } catch (const std::exception &e) {
-        co_return json_response(req, {{"error", e.what()}},
-                                http::status::bad_request);
-      }
-      // 插入动态
-      mysql::results result;
-      // TODO(): statement pool along with mysql connection pool
-      auto stmt = co_await mysql_conn->async_prepare_statement(
-          "INSERT INTO posts (user_id, content) VALUES (?, ?)");
-      co_await mysql_conn->async_execute(stmt.bind(user_id, content), result);
-      co_await mysql_conn->async_close_statement(stmt);
-
-      // 获取刚插入的post_id
-      uint64_t post_id = result.last_insert_id();
-
-      redis::request redis_req;
-      json::object post_cont({{"id", post_id},
-                              {"user_id", user_id},
-                              {"content", content},
-                              {"created_at", time_pt}});
-      redis_req.push("HSET", "posts", post_id, json::serialize(post_cont));
-      redis_req.push("TS.ADD", "post_id:" + std::to_string(user_id), time_pt,
-                     post_id);
-      co_await redis_conn->async_exec(redis_req, redis::ignore, redis_token);
-
-      co_return json_response(req, {{"post_id", post_id}});
-    }
-
     // 获取某个用户的动态历史 GET
     if (api_match("/api/post/", http::verb::get)) {
       json::object value;
@@ -367,9 +277,154 @@ auto handle_request(http::request<Body, http::basic_fields<Allocator>> &&req,
       }
       co_return json_response(req, {{"posts", post_hist}});
     }
+
+    // All operations starting from here requires JWT auth.
+    std::string_view token = req[http::field::authorization];
+    if (token.empty()) {
+      co_return json_response(req, {{"error", "unauthorized"}},
+                              http::status::unauthorized);
+    }
+    token.remove_prefix(strlen("Bearer "));
+    const auto decoded = jwt::decode<traits>({token.data(), token.size()});
+    auto verify = jwt::verify<traits>().allow_algorithm(jwt_algo).with_issuer(
+        issuer.data());
+    int id_from_token = std::stoi(decoded.get_id());
+    std::error_code ec;
+    verify.verify(decoded, ec);
+    if (ec || id_from_token == 0) {
+      co_return json_response(req, {{"error", "authorization failed"}},
+                              http::status::unauthorized);
+    }
+    // 关注用户 POST
+    if (api_match("/api/follow/", http::verb::post)) {
+      int user_id = std::stoi(req.target().substr(strlen("/api/follow/")));
+      if (id_from_token != user_id) {
+        co_return json_response(req, {{"error", "authorization failed"}},
+                                http::status::unauthorized);
+      }
+      std::string_view follow_name =
+          json::parse(req.body()).at("follow_name").as_string().c_str();
+
+      redis::request redis_req;
+      redis::response<std::optional<int64_t>> redis_resp;
+      mysql::results result;
+      redis_req.push("GET", follow_name);
+      co_await redis_conn->async_exec(redis_req, redis_resp, redis_token);
+      if (std::get<0>(redis_resp).value()) {
+        redis_req.clear();
+        int follow_id = std::get<0>(redis_resp).value().value();
+        redis_req.push("SADD", "follow:" + std::to_string(user_id), follow_id);
+        co_await redis_conn->async_exec(redis_req, redis::ignore, redis_token);
+
+        auto stmt = co_await mysql_conn->async_prepare_statement(
+            "INSERT INTO follows (follower_id, followee_id) VALUES (?, ?)");
+        co_await mysql_conn->async_execute(stmt.bind(user_id, follow_id),
+                                           result);
+        co_await mysql_conn->async_close_statement(stmt);
+      } else {
+        auto stmt = co_await mysql_conn->async_prepare_statement(
+            "INSERT INTO follows (follower_id, followee_id) "
+            "SELECT ?, user_id from users WHERE username = ?");
+        co_await mysql_conn->async_execute(stmt.bind(user_id, follow_name),
+                                           result);
+        co_await mysql_conn->async_close_statement(stmt);
+        // TODO(): non-existent username
+      }
+
+      co_return json_response(req, {{"status", "success"}});
+    }
+    // 获取关注列表 GET
+    if (api_match("/api/follow/", http::verb::get)) {
+      int user_id = std::stoi(req.target().substr(strlen("/api/follow/")));
+      if (id_from_token != user_id) {
+        co_return json_response(req, {{"error", "authorization failed"}},
+                                http::status::unauthorized);
+      }
+      redis::request redis_req;
+      redis::response<std::optional<std::vector<int64_t>>, int> redis_resp;
+      std::string key = "follow:" + std::to_string(user_id);
+      redis_req.push("SMEMBERS", key);
+      // redis_req.push("EXPIRE", key, 60);
+
+      co_await redis_conn->async_exec(redis_req, redis_resp, redis_token);
+      json::array all_follows;
+      if (!bypass_redis() && std::get<0>(redis_resp).value()) {
+        const auto &result = std::get<0>(redis_resp).value().value();
+        all_follows = json::array(result.begin(), result.end());
+      } else {
+        // Query MySQL
+        mysql::results mysql_result;
+        auto stmt = co_await mysql_conn->async_prepare_statement(
+            "SELECT followee_id from follows WHERE follower_id=?");
+        co_await mysql_conn->async_execute(stmt.bind(user_id), mysql_result);
+        co_await mysql_conn->async_close_statement(stmt);
+        all_follows.reserve(mysql_result.size());
+        for (const auto row : mysql_result.rows()) {
+          all_follows.push_back(row.at(0).as_int64());
+        }
+      }
+      co_return json_response(req, {{"followed", all_follows}});
+    }
+
+    // 发布动态 POST
+    if (api_match("/api/post/", http::verb::post)) {
+      int user_id;
+      std::string_view content;
+      auto local_time = std::chrono::time_point_cast<TimePoint::duration>(
+          Clock::now() + std::chrono::hours(8));
+      int64_t time_pt = local_time.time_since_epoch().count();
+      try {
+        auto value = json::parse(req.body()).as_object();
+        if (!value.contains("user_id")) {
+          co_return json_response(req, {{"error", "no user_id"}},
+                                  http::status::bad_request);
+        }
+        user_id = value.at("user_id").as_int64();
+        if (!value.contains("content")) {
+          co_return json_response(req, {{"error", "no content"}},
+                                  http::status::bad_request);
+        }
+        content = value.at("content").as_string().c_str();
+      } catch (const std::exception &e) {
+        co_return json_response(req, {{"error", e.what()}},
+                                http::status::bad_request);
+      }
+      if (id_from_token != user_id) {
+        co_return json_response(req, {{"error", "authorization failed"}},
+                                http::status::unauthorized);
+      }
+      // 插入动态
+      mysql::results result;
+      // TODO(): statement pool along with mysql connection pool
+      auto stmt = co_await mysql_conn->async_prepare_statement(
+          "INSERT INTO posts (user_id, content) VALUES (?, ?)");
+      co_await mysql_conn->async_execute(stmt.bind(user_id, content), result);
+      co_await mysql_conn->async_close_statement(stmt);
+
+      // 获取刚插入的post_id
+      uint64_t post_id = result.last_insert_id();
+
+      redis::request redis_req;
+      json::object post_cont({{"id", post_id},
+                              {"user_id", user_id},
+                              {"content", content},
+                              {"created_at", time_pt}});
+      redis_req.push("HSET", "posts", post_id, json::serialize(post_cont));
+      redis_req.push("TS.ADD", "post_id:" + std::to_string(user_id), time_pt,
+                     post_id);
+      co_await redis_conn->async_exec(redis_req, redis::ignore, redis_token);
+
+      co_return json_response(req, {{"post_id", post_id}});
+    }
+
+
     // 获取time时间点前最近n个订阅流
     if (api_match("/api/feed", http::verb::get)) {
       int user_id = std::stoi(req.target().substr(strlen("/api/feed/")));
+      if (id_from_token != user_id) {
+        co_return json_response(req, {{"error", "authorization failed"}},
+                                http::status::unauthorized);
+      }
       auto local_time = std::chrono::time_point_cast<TimePoint::duration>(
           Clock::now() + std::chrono::hours(8));
       auto time_pt = mysql::datetime(local_time);

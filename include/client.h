@@ -25,7 +25,7 @@ class client {
 
   const string_view host_, port_;
   int user_id_ = -1;
-  std::string id_str_;
+  std::string id_str_, token_;
 
   auto request(string_view api, verb method, boost::json::object &&body)
       -> boost::json::object;
